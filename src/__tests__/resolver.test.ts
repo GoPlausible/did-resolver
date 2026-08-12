@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import { vi, describe, it, expect, beforeAll } from 'vitest'
-import { Resolver, parse, DIDResolutionResult } from '../resolver'
+import { Resolver, parse, DIDResolutionResult, wrapLegacyResolver } from '../resolver'
 
 describe('resolver', () => {
   describe('parse()', () => {
@@ -138,6 +138,7 @@ describe('resolver', () => {
       expect(parse('did:method:%1233%Ay')).toEqual(null)
       expect(parse('did:CAP:id')).toEqual(null)
       expect(parse('did:method:id::anotherid%r9')).toEqual(null)
+      expect(parse('did:method:id;key=bad%value')).toEqual(null)
     })
   })
 
@@ -186,6 +187,29 @@ describe('resolver', () => {
         didResolutionMetadata: { error: 'unsupportedDidMethod' },
         didDocument: null,
         didDocumentMetadata: {},
+      })
+    })
+
+    it('does not resolve method names inherited from Object.prototype', async () => {
+      await expect(new Resolver().resolve('did:constructor:123')).resolves.toEqual({
+        didResolutionMetadata: { error: 'unsupportedDidMethod' },
+        didDocument: null,
+        didDocumentMetadata: {},
+      })
+    })
+
+    it('does not mutate a caller-owned registry when adding legacy resolvers', () => {
+      const registry = {}
+      new Resolver(registry, { legacyResolvers: { legacy: async (did) => ({ id: did }) } })
+      expect(registry).toEqual({})
+    })
+
+    it('normalizes non-Error failures from legacy resolvers', async () => {
+      const legacy = wrapLegacyResolver(async () => {
+        throw null
+      })
+      await expect(legacy('did:legacy:123', parse('did:legacy:123')!, new Resolver(), {})).resolves.toMatchObject({
+        didResolutionMetadata: { error: 'notFound', message: 'null' },
       })
     })
 
@@ -567,6 +591,41 @@ describe('resolver', () => {
           didDocumentMetadata: {},
         })
         return expect(mockmethod).toBeCalledTimes(2)
+      })
+
+      it('does not share cached representations with different accept options', async () => {
+        mockmethod = vi.fn(async (_did, _parsed, _resolver, options) => ({
+          didResolutionMetadata: { contentType: options.accept },
+          didDocument: { id: 'did:mock:abcdef' },
+          didDocumentMetadata: {},
+        }))
+        resolver = new Resolver({ mock: mockmethod }, { cache: true })
+
+        await resolver.resolve('did:mock:abcdef', { accept: 'application/did+json' })
+        await resolver.resolve('did:mock:abcdef', { accept: 'application/did+ld+json' })
+        expect(mockmethod).toBeCalledTimes(2)
+      })
+
+      it('coalesces concurrent resolutions for the same cache key', async () => {
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        mockmethod = vi.fn(async () => {
+          await gate
+          return {
+            didResolutionMetadata: {},
+            didDocument: { id: 'did:mock:abcdef' },
+            didDocumentMetadata: {},
+          }
+        })
+        resolver = new Resolver({ mock: mockmethod }, { cache: true })
+
+        const first = resolver.resolve('did:mock:abcdef')
+        const second = resolver.resolve('did:mock:abcdef')
+        release()
+        await Promise.all([first, second])
+        expect(mockmethod).toBeCalledTimes(1)
       })
     })
   })

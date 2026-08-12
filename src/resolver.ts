@@ -77,11 +77,7 @@ export interface DIDDocumentMetadata extends Extensible {
  * @see {@link https://www.w3.org/TR/did-core/#verification-relationships}
  */
 export type KeyCapabilitySection =
-  | 'authentication'
-  | 'assertionMethod'
-  | 'keyAgreement'
-  | 'capabilityInvocation'
-  | 'capabilityDelegation'
+  'authentication' | 'assertionMethod' | 'keyAgreement' | 'capabilityInvocation' | 'capabilityDelegation'
 
 /**
  * Represents a DID document.
@@ -240,7 +236,11 @@ export type DIDResolver = (
   options: DIDResolutionOptions
 ) => Promise<DIDResolutionResult>
 export type WrappedResolver = () => Promise<DIDResolutionResult>
-export type DIDCache = (parsed: ParsedDID, resolve: WrappedResolver) => Promise<DIDResolutionResult>
+export type DIDCache = (
+  parsed: ParsedDID,
+  resolve: WrappedResolver,
+  options?: DIDResolutionOptions
+) => Promise<DIDResolutionResult>
 export type LegacyDIDResolver = (did: string, parsed: ParsedDID, resolver: Resolvable) => Promise<DIDDocument>
 
 export type ResolverRegistry = Record<string, DIDResolver>
@@ -255,17 +255,31 @@ export interface ResolverOptions {
 }
 
 export function inMemoryCache(): DIDCache {
-  const cache: Map<string, DIDResolutionResult> = new Map()
-  return async (parsed: ParsedDID, resolve) => {
+  const cache = new Map<string, DIDResolutionResult>()
+  const pending = new Map<string, Promise<DIDResolutionResult>>()
+
+  return async (parsed: ParsedDID, resolve, options = {}) => {
     if (parsed.params && parsed.params['no-cache'] === 'true') return await resolve()
 
-    const cached = cache.get(parsed.didUrl)
+    // The requested representation affects the result and must be part of the
+    // key. Other standard resolution options are encoded in the DID URL.
+    const key = `${parsed.didUrl}\u0000${options.accept ?? ''}`
+    const cached = cache.get(key)
     if (cached !== undefined) return cached
-    const result = await resolve()
-    if (result.didResolutionMetadata?.error !== 'notFound') {
-      cache.set(parsed.didUrl, result)
+
+    const inFlight = pending.get(key)
+    if (inFlight) return inFlight
+
+    const resolution = resolve()
+    pending.set(key, resolution)
+    try {
+      const result = await resolution
+      // Resolution errors may be transient. Cache successful results only.
+      if (!result.didResolutionMetadata?.error) cache.set(key, result)
+      return result
+    } finally {
+      pending.delete(key)
     }
-    return result
   }
 }
 
@@ -277,7 +291,7 @@ const PCT_ENCODED = '(?:%[0-9a-fA-F]{2})'
 const ID_CHAR = `(?:[a-zA-Z0-9._-]|${PCT_ENCODED})`
 const METHOD = '([a-z0-9]+)'
 const METHOD_ID = `((?:${ID_CHAR}*:)*(${ID_CHAR}+))`
-const PARAM_CHAR = '[a-zA-Z0-9_.:%-]'
+const PARAM_CHAR = `(?:[a-zA-Z0-9_.:-]|${PCT_ENCODED})`
 const PARAM = `;${PARAM_CHAR}+=${PARAM_CHAR}*`
 const PARAMS = `((${PARAM})*)`
 const PATH = `(/[^#?]*)?`
@@ -305,8 +319,8 @@ export function parse(didUrl: string): ParsedDID | null {
       const params = sections[4].slice(1).split(';')
       parts.params = {}
       for (const p of params) {
-        const kv = p.split('=')
-        parts.params[kv[0]] = kv[1]
+        const separator = p.indexOf('=')
+        parts.params[p.slice(0, separator)] = p.slice(separator + 1)
       }
     }
     if (sections[6]) parts.path = sections[6]
@@ -332,13 +346,12 @@ export function wrapLegacyResolver(resolve: LegacyDIDResolver): DIDResolver {
         didResolutionMetadata: { contentType: 'application/did+ld+json' },
         didDocument: doc,
       }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } catch (e: any) {
+    } catch (error: unknown) {
       return {
         ...EMPTY_RESULT,
         didResolutionMetadata: {
           error: 'notFound',
-          message: e.toString(), // This is not in spec, but may be helpful
+          message: error instanceof Error ? error.message : String(error), // Non-standard, but useful to callers.
         },
       }
     }
@@ -361,10 +374,13 @@ export class Resolver implements Resolvable {
   private readonly cache: DIDCache
 
   constructor(registry: ResolverRegistry = {}, options: ResolverOptions = {}) {
-    this.registry = registry
+    // Copy into a null-prototype object: method names such as `constructor`
+    // must not resolve through Object.prototype, and caller-owned registries
+    // must not be mutated when legacy resolvers are installed.
+    this.registry = Object.assign(Object.create(null) as ResolverRegistry, registry)
     this.cache = options.cache === true ? inMemoryCache() : options.cache || noCache
     if (options.legacyResolvers) {
-      Object.keys(options.legacyResolvers).map((methodName) => {
+      Object.keys(options.legacyResolvers).forEach((methodName) => {
         if (!this.registry[methodName]) {
           this.registry[methodName] = wrapLegacyResolver(options.legacyResolvers![methodName])
         }
@@ -387,6 +403,6 @@ export class Resolver implements Resolvable {
         didResolutionMetadata: { error: 'unsupportedDidMethod' },
       }
     }
-    return this.cache(parsed, () => resolver(parsed.did, parsed, this, options))
+    return this.cache(parsed, () => resolver(parsed.did, parsed, this, options), options)
   }
 }
